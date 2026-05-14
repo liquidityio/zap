@@ -195,15 +195,25 @@ func Connect(ctx context.Context, serviceType string, opts ...ClientOption) (*Cl
 	// will simply fail Call() with a typed error from
 	// Node.getOrConnect (now nil-safe).
 	if o.Discovery != nil {
-		for _, p := range disc.Peers() {
+		userDisc := disc
+		for _, p := range userDisc.Peers() {
 			if err := n.ConnectDirect(p.Address); err != nil {
 				o.Logger.Debug("zapclient: pre-dial failed",
 					"peer", p.NodeID, "addr", p.Address, "error", err)
 			}
 		}
 		// Use the live conn cache as the canonical peer list for
-		// pick() — its NodeIDs are the real wire identities.
-		disc = &nodeBackedDiscovery{node: n, serviceType: serviceType}
+		// pick(). When all conns die (remote pod restart) the
+		// fallback Discovery rebuilds via re-pre-dial against the
+		// user-supplied peer list — fixes the
+		// "no peers discovered after peer restart" lifetime issue
+		// that previously required a caller-pod restart to recover.
+		disc = &nodeBackedDiscovery{
+			node:        n,
+			serviceType: serviceType,
+			fallback:    userDisc,
+			logger:      o.Logger,
+		}
 	}
 
 	return &Client{
@@ -224,26 +234,80 @@ func Connect(ctx context.Context, serviceType string, opts ...ClientOption) (*Cl
 // downstream code path needs to dial again; if a Call eventually
 // needs a fresh dial it'll fall through to getOrConnect which now
 // has a guarded nil-discovery branch.
+//
+// The fallback field keeps a reference to the user-supplied
+// Discovery (typically a static peer list). When the node has zero
+// live connections — every cached conn died because the remote pod
+// cycled — Peers() runs the same pre-dial loop that ran at Connect
+// time. This is the difference between "lazy-client stays broken
+// until our pod restarts" and "lazy-client transparently reconnects
+// on the next Call after a peer flap". Both directions of every
+// REQ-2 mesh edge benefit (BD ⇄ ATS, ATS ⇄ TA, TA → BD, …) — every
+// caller side previously had to bounce when its remote peer cycled.
 type nodeBackedDiscovery struct {
-	node        nodePeerLister
+	node        nodeDialer
 	serviceType string
+	fallback    Discovery // user-supplied static-peer Discovery, if any
+	logger      logger
 }
 
-// nodePeerLister narrows the *zap.Node surface this Discovery
-// requires, so the package compiles without importing zap.Node
+// nodeDialer narrows the *zap.Node surface this Discovery requires.
+// Peers() lists live connection NodeIDs; ConnectDirect dials a fresh
+// peer by address. The package compiles without importing zap.Node
 // concretely from a deeper interface.
+type nodeDialer interface {
+	Peers() []string
+	ConnectDirect(addr string) error
+}
+
+// logger is the slog subset we use here. Avoids a hard slog import
+// in tests that supply a no-op logger.
+type logger interface {
+	Debug(msg string, args ...any)
+}
+
+// nodePeerLister kept for backwards-compat with existing test code
+// that constructs a nodeBackedDiscovery without the fallback field.
 type nodePeerLister interface {
 	Peers() []string
 }
 
+// Peers returns one entry per live node-cached connection. If the
+// cache is empty AND a fallback (user-supplied) Discovery is
+// configured, the fallback's peers are re-dialled via ConnectDirect
+// to repopulate the cache. Best-effort: ConnectDirect failures are
+// logged at debug and we return whatever the cache has after the
+// attempt (possibly empty — in which case the caller gets ErrNoPeers
+// from pick(), exactly as before).
 func (d *nodeBackedDiscovery) Peers() []Peer {
 	ids := d.node.Peers()
+	if len(ids) == 0 && d.fallback != nil {
+		// Cache emptied — every conn died (remote restart) or none
+		// ever connected. Run the same pre-dial we ran at Connect
+		// time. On success the node-cache repopulates and the next
+		// .Peers() call (typically the immediate retry from
+		// c.pick()) finds non-empty IDs.
+		for _, p := range d.fallback.Peers() {
+			if err := d.node.ConnectDirect(p.Address); err != nil {
+				if d.logger != nil {
+					d.logger.Debug("zapclient: re-pre-dial after peer loss failed",
+						"peer", p.NodeID, "addr", p.Address, "error", err)
+				}
+			}
+		}
+		ids = d.node.Peers()
+	}
 	out := make([]Peer, 0, len(ids))
 	for _, id := range ids {
 		out = append(out, Peer{NodeID: id, ServiceType: d.serviceType})
 	}
 	return out
 }
+
+// PeerCount mirrors Peers() (sans the alloc) but does NOT trigger a
+// re-pre-dial — that side effect belongs only to the path that's
+// about to use the peer (pick → Call). Callers polling PeerCount in
+// a tight loop shouldn't accidentally hammer ConnectDirect.
 func (d *nodeBackedDiscovery) PeerCount() int      { return len(d.node.Peers()) }
 func (d *nodeBackedDiscovery) ServiceType() string { return d.serviceType }
 func (d *nodeBackedDiscovery) Start() error        { return nil }

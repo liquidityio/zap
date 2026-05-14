@@ -240,3 +240,110 @@ func TestServer_RegisterAndStart_NoDiscovery(t *testing.T) {
 		t.Errorf("handler should not fire without an inbound call")
 	}
 }
+
+// TestNodeBackedDiscovery_RePreDialOnEmpty asserts that when the
+// node cache empties (every peer disconnects), the discovery
+// reissues the pre-dial against the user-supplied fallback rather
+// than returning a stuck-empty peer list. This is the regression
+// guard for the "lazy ZAP client stays broken after peer pod
+// restart" production bug (2026-05-14).
+func TestNodeBackedDiscovery_RePreDialOnEmpty(t *testing.T) {
+	dialed := []string{}
+	node := &fakeNode{
+		peerIDs:    nil, // start empty — like a fresh process after every conn dropped
+		dialResult: func(addr string) error { dialed = append(dialed, addr); return nil },
+	}
+	fallback := emptyAddrDiscovery{
+		peers: []Peer{
+			{NodeID: "static-0", Address: "host-a:8181"},
+			{NodeID: "static-1", Address: "host-b:8181"},
+		},
+	}
+	d := &nodeBackedDiscovery{
+		node:        node,
+		serviceType: "svc",
+		fallback:    fallback,
+		logger:      noopLogger{},
+	}
+
+	_ = d.Peers()
+	if got, want := len(dialed), 2; got != want {
+		t.Fatalf("expected %d re-pre-dial attempts, got %d (%v)", want, got, dialed)
+	}
+	if dialed[0] != "host-a:8181" || dialed[1] != "host-b:8181" {
+		t.Errorf("unexpected dial order: %v", dialed)
+	}
+}
+
+// TestNodeBackedDiscovery_NoFallbackOnPopulatedCache asserts the
+// fast path: when the node cache already has live peers, Peers()
+// does NOT trigger a re-dial (which would be wasteful and could
+// hammer ConnectDirect from a polling caller).
+func TestNodeBackedDiscovery_NoFallbackOnPopulatedCache(t *testing.T) {
+	dialed := 0
+	node := &fakeNode{
+		peerIDs:    []string{"alive-peer-0"},
+		dialResult: func(string) error { dialed++; return nil },
+	}
+	d := &nodeBackedDiscovery{
+		node:        node,
+		serviceType: "svc",
+		fallback:    emptyAddrDiscovery{peers: []Peer{{NodeID: "static-0", Address: "host-a:8181"}}},
+		logger:      noopLogger{},
+	}
+	out := d.Peers()
+	if len(out) != 1 || out[0].NodeID != "alive-peer-0" {
+		t.Fatalf("expected one live peer, got %+v", out)
+	}
+	if dialed != 0 {
+		t.Errorf("unexpected re-pre-dial when cache was populated (%d dials)", dialed)
+	}
+}
+
+// TestNodeBackedDiscovery_PeerCountNoSideEffect asserts that
+// PeerCount() does not trigger the re-pre-dial side effect — only
+// Peers() does. PeerCount is consulted by callers that poll for
+// readiness; we don't want each poll to issue ConnectDirect calls.
+func TestNodeBackedDiscovery_PeerCountNoSideEffect(t *testing.T) {
+	dialed := 0
+	node := &fakeNode{
+		peerIDs:    nil,
+		dialResult: func(string) error { dialed++; return nil },
+	}
+	d := &nodeBackedDiscovery{
+		node:        node,
+		serviceType: "svc",
+		fallback:    emptyAddrDiscovery{peers: []Peer{{NodeID: "static-0", Address: "host-a:8181"}}},
+		logger:      noopLogger{},
+	}
+	_ = d.PeerCount()
+	if dialed != 0 {
+		t.Errorf("PeerCount() triggered %d re-pre-dial calls — should be 0", dialed)
+	}
+}
+
+type fakeNode struct {
+	peerIDs    []string
+	dialResult func(addr string) error
+}
+
+func (f *fakeNode) Peers() []string {
+	out := make([]string, len(f.peerIDs))
+	copy(out, f.peerIDs)
+	return out
+}
+func (f *fakeNode) ConnectDirect(addr string) error { return f.dialResult(addr) }
+
+type emptyAddrDiscovery struct {
+	peers []Peer
+}
+
+func (e emptyAddrDiscovery) Peers() []Peer       { return e.peers }
+func (e emptyAddrDiscovery) PeerCount() int      { return len(e.peers) }
+func (e emptyAddrDiscovery) ServiceType() string { return "svc" }
+func (e emptyAddrDiscovery) Start() error        { return nil }
+func (e emptyAddrDiscovery) Stop()               {}
+
+type noopLogger struct{}
+
+func (noopLogger) Debug(_ string, _ ...any) {}
