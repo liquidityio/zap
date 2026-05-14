@@ -536,7 +536,17 @@ func (n *Node) getOrConnect(peerID string) (*Conn, error) {
 		return conn, nil
 	}
 
-	// Look up peer via discovery
+	// No cached connection. If discovery is disabled (NoDiscovery=true,
+	// typically because the caller wired an external Discovery on
+	// zapclient.Client.WithDiscovery), the caller is expected to have
+	// pre-populated the connection cache via ConnectDirect. Returning
+	// a clear error here instead of dereferencing the nil discovery
+	// is the difference between "peer not found" and a SIGSEGV (the
+	// pre-fix behaviour that took down every zapclient.Client.Call
+	// when paired with a custom Discovery).
+	if n.discovery == nil {
+		return nil, fmt.Errorf("peer not found: %s (no discovery; pre-dial via ConnectDirect)", peerID)
+	}
 	peers := n.discovery.Peers()
 	var peer *mdns.Peer
 	for _, p := range peers {

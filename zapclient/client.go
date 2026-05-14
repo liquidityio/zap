@@ -174,6 +174,26 @@ func Connect(ctx context.Context, serviceType string, opts ...ClientOption) (*Cl
 		return nil, fmt.Errorf("zapclient: discover: %w", err)
 	}
 
+	// External-Discovery path: when the caller wired its own Discovery
+	// (e.g., a static-peer list for K8s clusters without mDNS multicast),
+	// the underlying Node was constructed with NoDiscovery=true and has
+	// no mdns.Discovery of its own. Pre-dial each discovered peer so
+	// the Node's conn cache is warm before the first Call → getOrConnect
+	// runs. Without this, getOrConnect returns "peer not found (no
+	// discovery)" — the Node has no way to map peer.NodeID → address.
+	//
+	// Dial failures are non-fatal here: log + continue. The peer may
+	// simply not be reachable yet; subsequent retries surface the
+	// failure to the caller via Call/Send.
+	if o.Discovery != nil {
+		for _, p := range disc.Peers() {
+			if err := n.ConnectDirect(p.Address); err != nil {
+				o.Logger.Debug("zapclient: pre-dial failed",
+					"peer", p.NodeID, "addr", p.Address, "error", err)
+			}
+		}
+	}
+
 	return &Client{
 		node:     n,
 		disc:     disc,
