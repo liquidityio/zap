@@ -59,6 +59,40 @@ type Conn struct {
 	pendMu   sync.Mutex
 }
 
+// enableTCPKeepAlive turns on TCP keepalive with K8s-friendly defaults so a
+// silently-vanished peer evicts from n.conns within ~30s. Without this, a
+// remote pod cycle leaves a half-dead conn cached for as long as
+// iptables/Calico conntrack holds the entry (~5min) — long enough that
+// nodeBackedDiscovery in zapclient never sees an empty cache and never
+// triggers its re-pre-dial fallback. Idle=15s, 3 probes 5s apart.
+//
+// No-ops on non-TCP conns (test transports). For TLS conns set keepalive
+// on the underlying *net.TCPConn BEFORE wrapping in tls.Client/tls.Server.
+func enableTCPKeepAlive(c net.Conn) {
+	tc := tcpUnderlying(c)
+	if tc == nil {
+		return
+	}
+	_ = tc.SetKeepAliveConfig(net.KeepAliveConfig{
+		Enable:   true,
+		Idle:     15 * time.Second,
+		Interval: 5 * time.Second,
+		Count:    3,
+	})
+}
+
+func tcpUnderlying(c net.Conn) *net.TCPConn {
+	if tc, ok := c.(*net.TCPConn); ok {
+		return tc
+	}
+	if w, ok := c.(interface{ NetConn() net.Conn }); ok {
+		if tc, ok := w.NetConn().(*net.TCPConn); ok {
+			return tc
+		}
+	}
+	return nil
+}
+
 // Handler handles incoming ZAP messages.
 type Handler func(ctx context.Context, from string, msg *Message) (*Message, error)
 
@@ -299,6 +333,7 @@ func (n *Node) acceptLoop() {
 			}
 		}
 
+		enableTCPKeepAlive(conn)
 		n.wg.Add(1)
 		go n.handleConn(conn)
 	}
@@ -565,6 +600,7 @@ func (n *Node) getOrConnect(peerID string) (*Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to %s: %w", addr, err)
 	}
+	enableTCPKeepAlive(netConn)
 	if n.tlsCfg != nil {
 		netConn = tls.Client(netConn, n.tlsCfg)
 	}
@@ -707,6 +743,7 @@ func (n *Node) ConnectDirect(addr string) error {
 	if err != nil {
 		return fmt.Errorf("failed to connect to %s: %w", addr, err)
 	}
+	enableTCPKeepAlive(netConn)
 	if n.tlsCfg != nil {
 		netConn = tls.Client(netConn, n.tlsCfg)
 	}
