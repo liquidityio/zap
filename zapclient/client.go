@@ -177,14 +177,23 @@ func Connect(ctx context.Context, serviceType string, opts ...ClientOption) (*Cl
 	// External-Discovery path: when the caller wired its own Discovery
 	// (e.g., a static-peer list for K8s clusters without mDNS multicast),
 	// the underlying Node was constructed with NoDiscovery=true and has
-	// no mdns.Discovery of its own. Pre-dial each discovered peer so
-	// the Node's conn cache is warm before the first Call → getOrConnect
-	// runs. Without this, getOrConnect returns "peer not found (no
-	// discovery)" — the Node has no way to map peer.NodeID → address.
+	// no mdns.Discovery of its own. Two cooperating fixes here:
 	//
-	// Dial failures are non-fatal here: log + continue. The peer may
-	// simply not be reachable yet; subsequent retries surface the
-	// failure to the caller via Call/Send.
+	//   1. Pre-dial each discovered peer via Node.ConnectDirect — that
+	//      handshakes with the remote and populates Node.conns under
+	//      the REAL peer NodeID (which the remote announced on the
+	//      wire). The static Discovery's synthetic NodeIDs (e.g.,
+	//      "liquidity-bd-static-0") were never going to match.
+	//   2. Swap Client.disc for a node-backed Discovery that reads
+	//      from Node.Peers() — the actual handshake NodeIDs. Picker
+	//      then selects from those, and Node.Call → getOrConnect
+	//      hits the live conn cache instead of consulting the
+	//      external (now-stale) Discovery.
+	//
+	// Dial failures here are non-fatal: log + continue. The pre-dial
+	// is best-effort; if no peer is reachable the resulting Client
+	// will simply fail Call() with a typed error from
+	// Node.getOrConnect (now nil-safe).
 	if o.Discovery != nil {
 		for _, p := range disc.Peers() {
 			if err := n.ConnectDirect(p.Address); err != nil {
@@ -192,6 +201,9 @@ func Connect(ctx context.Context, serviceType string, opts ...ClientOption) (*Cl
 					"peer", p.NodeID, "addr", p.Address, "error", err)
 			}
 		}
+		// Use the live conn cache as the canonical peer list for
+		// pick() — its NodeIDs are the real wire identities.
+		disc = &nodeBackedDiscovery{node: n, serviceType: serviceType}
 	}
 
 	return &Client{
@@ -203,6 +215,39 @@ func Connect(ctx context.Context, serviceType string, opts ...ClientOption) (*Cl
 		stopDisc: stopDisc,
 	}, nil
 }
+
+// nodeBackedDiscovery is the Discovery wired in after a successful
+// external-Discovery pre-dial. Its Peers() returns one entry per
+// live cached connection on the Node — the real handshake NodeIDs,
+// not whatever synthetic identifiers the user-supplied Discovery
+// returned. Address is left empty here because nothing in the
+// downstream code path needs to dial again; if a Call eventually
+// needs a fresh dial it'll fall through to getOrConnect which now
+// has a guarded nil-discovery branch.
+type nodeBackedDiscovery struct {
+	node        nodePeerLister
+	serviceType string
+}
+
+// nodePeerLister narrows the *zap.Node surface this Discovery
+// requires, so the package compiles without importing zap.Node
+// concretely from a deeper interface.
+type nodePeerLister interface {
+	Peers() []string
+}
+
+func (d *nodeBackedDiscovery) Peers() []Peer {
+	ids := d.node.Peers()
+	out := make([]Peer, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, Peer{NodeID: id, ServiceType: d.serviceType})
+	}
+	return out
+}
+func (d *nodeBackedDiscovery) PeerCount() int      { return len(d.node.Peers()) }
+func (d *nodeBackedDiscovery) ServiceType() string { return d.serviceType }
+func (d *nodeBackedDiscovery) Start() error        { return nil }
+func (d *nodeBackedDiscovery) Stop()               {}
 
 // MustConnect is Connect that panics on error.
 func MustConnect(ctx context.Context, serviceType string, opts ...ClientOption) *Client {
