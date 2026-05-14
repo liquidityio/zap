@@ -140,7 +140,17 @@ func (s *Server) Register(procedure string, h ProcedureHandler) error {
 	}
 	s.procedures[op] = registration{procedure: procedure, handler: h}
 	s.procNames[procedure] = op
-	s.node.Handle(op, s.dispatch)
+	// Node.Handle keys its dispatch table by the post-shift value: the
+	// read loop computes `msgType := msg.Flags() >> 8` and looks up
+	// handlers[msgType]. ProcedureOpcode stores the byte in the HIGH
+	// position (uint16(b) << 8), so Register MUST unshift before
+	// calling Handle, or the lookup misses and every Call hangs until
+	// the client's context expires.
+	//
+	// Symptom pre-fix: server logs "Peer connected" + "Peer disconnected"
+	// with NO procedure dispatch in between, even though Register
+	// nominally succeeded. Diagnosed on liquidityio devnet 2026-05-14.
+	s.node.Handle(op>>8, s.dispatch)
 	return nil
 }
 
